@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Mapping, cast
 
+from nanobot.agent.agent_plugins import agent_plugins_payload, set_agent_plugin_enabled
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.apps.protocol import app_manifest, compact_dict
 from nanobot.config.loader import load_config, resolve_config_env_vars, save_config
@@ -837,6 +838,44 @@ def _custom_payload(
     }
 
 
+def _agent_plugin_payload(plugin: Mapping[str, Any]) -> dict[str, Any]:
+    enabled = bool(plugin.get("enabled"))
+    permissions = plugin.get("permissions")
+    mcp_servers = plugin.get("mcp_servers")
+    permission_names = (
+        [str(item) for item in cast(list[object], permissions)]
+        if isinstance(permissions, list)
+        else []
+    )
+    server_names = (
+        [str(item) for item in cast(list[object], mcp_servers)]
+        if isinstance(mcp_servers, list)
+        else []
+    )
+    return {
+        "name": f"plugin-{plugin['name']}",
+        "display_name": str(plugin.get("display_name") or plugin["name"]),
+        "category": str(plugin.get("category") or "plugin"),
+        "description": str(plugin.get("description") or "Agent Plugin"),
+        "docs_url": str(plugin.get("repository") or ""),
+        "transport": "stdio",
+        "requires": ", ".join(permission_names),
+        "note": "",
+        "install_supported": True,
+        "installed": True,
+        "configured": enabled,
+        "available": enabled,
+        "status": "configured" if enabled else "not_installed",
+        "logo_url": None,
+        "brand_color": plugin.get("accent_color"),
+        "required_fields": [],
+        "connection_summary": ", ".join(server_names),
+        "enabled_tools": ["*"],
+        "tool_names": [],
+        "source": "agent-plugin",
+    }
+
+
 def mcp_presets_payload(
     *,
     last_action: dict[str, Any] | None = None,
@@ -854,9 +893,17 @@ def mcp_presets_payload(
         for name, cfg in sorted(config.tools.mcp_servers.items())
         if name not in known
     ]
+    plugin_state = agent_plugins_payload(config.workspace_path)
+    existing_names = {str(row["name"]) for row in (*preset_rows, *custom_rows)}
+    plugin_rows = [
+        row
+        for plugin in plugin_state["plugins"]
+        if (row := _agent_plugin_payload(plugin))["name"] not in existing_names
+    ]
     payload: dict[str, Any] = {
-        "presets": [*preset_rows, *custom_rows],
-        "installed_count": len(config.tools.mcp_servers),
+        "presets": [*preset_rows, *custom_rows, *plugin_rows],
+        "installed_count": len(config.tools.mcp_servers)
+        + sum(int(row["configured"]) for row in plugin_rows),
     }
     if last_action is not None:
         payload["last_action"] = last_action
@@ -1343,6 +1390,27 @@ async def mcp_presets_settings_action(
     """Run a WebUI MCP preset action and hot-reload the agent when config changes."""
     if action is None:
         return mcp_presets_payload()
+    name = (_query_first(query, "name") or "").strip()
+    if name.startswith("plugin-"):
+        config = load_config()
+        plugin_name = name.removeprefix("plugin-")
+        installed = {
+            str(plugin["name"])
+            for plugin in agent_plugins_payload(config.workspace_path)["plugins"]
+        }
+        if name not in config.tools.mcp_servers and plugin_name in installed:
+            if action not in {"enable", "remove"}:
+                raise McpPresetError("Agent Plugins support enable and disable actions only")
+            state = await asyncio.to_thread(
+                set_agent_plugin_enabled,
+                config.workspace_path,
+                plugin_name,
+                action == "enable",
+            )
+            payload = mcp_presets_payload(last_action=state.get("last_action"))
+            if reload_mcp is not None:
+                payload = attach_mcp_hot_reload_result(payload, await reload_mcp())
+            return payload
     if action == "test":
         return await mcp_presets_test_action(query)
     if action in _CUSTOM_ACTIONS:
